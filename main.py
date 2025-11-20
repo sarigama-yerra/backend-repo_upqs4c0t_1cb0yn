@@ -1,22 +1,19 @@
 import os
 import io
 import base64
+import hashlib
+import hmac
+import secrets
 from datetime import datetime, timedelta, timezone
-from typing import Optional, List, Literal
+from typing import Optional
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, Body, Query
+from fastapi import FastAPI, HTTPException, Depends, Body, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 
 from database import db, create_document, get_documents
 from schemas import User as UserSchema, Attendance as AttendanceSchema, Session as SessionSchema
-
-from passlib.context import CryptContext
-import jwt
-from cryptography.fernet import Fernet
-from PIL import Image
-import imagehash
 
 # -----------------------------------------------------------------------------
 # Configuration
@@ -39,18 +36,140 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24
 
 FACE_ENC_KEY = os.getenv("FACE_ENC_KEY")
 if not FACE_ENC_KEY:
-    # Derive a deterministic Fernet key from SECRET_KEY for demo env
     derived = base64.urlsafe_b64encode((SECRET_KEY * 2)[:32].encode())
     FACE_ENC_KEY = derived.decode()
-fernet = Fernet(FACE_ENC_KEY)
 
 # Geofence config
 COLLEGE_LAT = float(os.getenv("COLLEGE_LAT", "12.9716"))
 COLLEGE_LNG = float(os.getenv("COLLEGE_LNG", "77.5946"))
 GEOFENCE_RADIUS_M = float(os.getenv("GEOFENCE_RADIUS_M", "300.0"))
 
-# Password hashing (pure Python, avoids system deps)
-pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
+# -----------------------------------------------------------------------------
+# Password hashing (pure Python PBKDF2-SHA256)
+# -----------------------------------------------------------------------------
+PBKDF2_ITERATIONS = 240_000
+
+def hash_password(password: str) -> str:
+    if not isinstance(password, str):
+        raise ValueError("password must be str")
+    salt = secrets.token_bytes(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PBKDF2_ITERATIONS)
+    return "pbkdf2_sha256$%d$%s$%s" % (
+        PBKDF2_ITERATIONS,
+        salt.hex(),
+        dk.hex(),
+    )
+
+
+def verify_password(password: str, stored: str) -> bool:
+    try:
+        algo, iter_s, salt_hex, hash_hex = stored.split("$")
+        if algo != "pbkdf2_sha256":
+            return False
+        iterations = int(iter_s)
+        salt = bytes.fromhex(salt_hex)
+        expected = bytes.fromhex(hash_hex)
+        dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+        return hmac.compare_digest(dk, expected)
+    except Exception:
+        return False
+
+# -----------------------------------------------------------------------------
+# Lazy import helpers
+# -----------------------------------------------------------------------------
+_jwt = None
+
+def _get_jwt():
+    global _jwt
+    if _jwt is None:
+        try:
+            import jwt as pyjwt  # PyJWT
+            _jwt = pyjwt
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"JWT library not available: {e}")
+    return _jwt
+
+_fernet_obj = None
+
+def _get_fernet():
+    global _fernet_obj
+    if _fernet_obj is None:
+        try:
+            from cryptography.fernet import Fernet
+            key = FACE_ENC_KEY
+            _fernet_obj = Fernet(key)
+        except Exception:
+            _fernet_obj = False  # mark unavailable
+    return _fernet_obj
+
+
+def encrypt_bytes(data: bytes) -> bytes:
+    f = _get_fernet()
+    if f:
+        return f.encrypt(data)
+    return b"B64:" + base64.b64encode(data)
+
+
+def decrypt_bytes(data: bytes) -> bytes:
+    f = _get_fernet()
+    if f:
+        return f.decrypt(data)
+    if data.startswith(b"B64:"):
+        return base64.b64decode(data[4:])
+    return data
+
+
+def phash_from_image_bytes(data: bytes) -> str:
+    try:
+        from PIL import Image
+        import imagehash
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Image libraries not available: {e}")
+    image = Image.open(io.BytesIO(data)).convert("RGB").resize((256, 256))
+    return str(imagehash.phash(image))
+
+# -----------------------------------------------------------------------------
+# JWT helpers
+# -----------------------------------------------------------------------------
+
+def create_access_token(user_id: str, role: str) -> str:
+    now = datetime.now(timezone.utc)
+    payload = {
+        "sub": user_id,
+        "role": role,
+        "type": "access",
+        "iat": int(now.timestamp()),
+        "exp": int((now + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)).timestamp()),
+    }
+    return _get_jwt().encode(payload, SECRET_KEY, algorithm=JWT_ALG)
+
+
+def create_reset_token(user_id: str) -> str:
+    now = datetime.now(timezone.utc)
+    payload = {
+        "sub": user_id,
+        "type": "reset",
+        "iat": int(now.timestamp()),
+        "exp": int((now + timedelta(minutes=30)).timestamp()),
+    }
+    return _get_jwt().encode(payload, SECRET_KEY, algorithm=JWT_ALG)
+
+
+def decode_token(token: str) -> dict:
+    try:
+        return _get_jwt().decode(token, SECRET_KEY, algorithms=[JWT_ALG])
+    except Exception as e:
+        from fastapi import HTTPException as _HTTPException
+        if "Expired" in str(e):
+            raise _HTTPException(status_code=401, detail="Token expired")
+        raise _HTTPException(status_code=401, detail="Invalid token")
+
+
+def require_auth(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    payload = decode_token(credentials.credentials)
+    if payload.get("type") != "access":
+        raise HTTPException(status_code=401, detail="Invalid token type")
+    return payload
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -62,56 +181,6 @@ def to_object_id(id_str: str):
         return ObjectId(id_str)
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid id")
-
-
-def hash_password(password: str) -> str:
-    return pwd_context.hash(password)
-
-
-def verify_password(password: str, hashed: str) -> bool:
-    try:
-        return pwd_context.verify(password, hashed)
-    except Exception:
-        return False
-
-
-def create_access_token(user_id: str, role: str) -> str:
-    now = datetime.now(timezone.utc)
-    payload = {
-        "sub": user_id,
-        "role": role,
-        "type": "access",
-        "iat": int(now.timestamp()),
-        "exp": int((now + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)).timestamp())
-    }
-    return jwt.encode(payload, SECRET_KEY, algorithm=JWT_ALG)
-
-
-def create_reset_token(user_id: str) -> str:
-    now = datetime.now(timezone.utc)
-    payload = {
-        "sub": user_id,
-        "type": "reset",
-        "iat": int(now.timestamp()),
-        "exp": int((now + timedelta(minutes=30)).timestamp())
-    }
-    return jwt.encode(payload, SECRET_KEY, algorithm=JWT_ALG)
-
-
-def decode_token(token: str) -> dict:
-    try:
-        return jwt.decode(token, SECRET_KEY, algorithms=[JWT_ALG])
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token expired")
-    except Exception:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-
-def require_auth(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    payload = decode_token(credentials.credentials)
-    if payload.get("type") != "access":
-        raise HTTPException(status_code=401, detail="Invalid token type")
-    return payload
 
 
 def haversine_m(lat1, lon1, lat2, lon2):
@@ -129,20 +198,6 @@ def check_geofence(lat: Optional[float], lng: Optional[float]) -> bool:
         return False
     dist = haversine_m(lat, lng, COLLEGE_LAT, COLLEGE_LNG)
     return dist <= GEOFENCE_RADIUS_M
-
-
-def phash_from_image_bytes(data: bytes) -> str:
-    image = Image.open(io.BytesIO(data)).convert("RGB").resize((256, 256))
-    return str(imagehash.phash(image))
-
-
-def encrypt_bytes(data: bytes) -> bytes:
-    return fernet.encrypt(data)
-
-
-def decrypt_bytes(data: bytes) -> bytes:
-    return fernet.decrypt(data)
-
 
 # -----------------------------------------------------------------------------
 # Models
@@ -206,7 +261,6 @@ def test_database():
 # ---------------------- Auth ----------------------
 @app.post("/auth/register")
 def register(req: RegisterRequest):
-    # Check unique
     if db["user"].find_one({"username": req.username}):
         raise HTTPException(status_code=400, detail="Username already exists")
     user = UserSchema(
@@ -238,10 +292,8 @@ def login(req: LoginRequest):
 def forgot(req: ForgotRequest):
     u = db["user"].find_one({"username": req.username})
     if not u:
-        # Don't reveal existence
         return {"status": "ok"}
     reset_token = create_reset_token(str(u["_id"]))
-    # In real app, email/SMS the token; here we return
     return {"reset_token": reset_token}
 
 @app.post("/auth/reset")
@@ -270,11 +322,16 @@ def update_me(req: UpdateProfileRequest, auth=Depends(require_auth)):
         db["user"].update_one({"_id": to_object_id(auth["sub"])}, {"$set": updates})
     return {"status": "updated"}
 
+class FaceUpload(BaseModel):
+    image_base64: str
+
 @app.post("/me/photo")
-async def upload_face(file: UploadFile = File(...), auth=Depends(require_auth)):
-    data = await file.read()
+async def upload_face(payload: FaceUpload, auth=Depends(require_auth)):
     try:
+        data = base64.b64decode(payload.image_base64.split(",")[-1])
         ph = phash_from_image_bytes(data)
+    except HTTPException:
+        raise
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid image")
     enc = encrypt_bytes(data)
@@ -297,7 +354,7 @@ def generate_self_qr(geo: Geopoint = Body(None), auth=Depends(require_auth)):
     if geo and geo.lat and geo.lng:
         payload["lat"] = geo.lat
         payload["lng"] = geo.lng
-    token = jwt.encode(payload, SECRET_KEY, algorithm=JWT_ALG)
+    token = _get_jwt().encode(payload, SECRET_KEY, algorithm=JWT_ALG)
     return {"qr_token": token}
 
 @app.post("/qr/session")
@@ -324,35 +381,44 @@ def generate_session_qr(req: QRSessionCreate, auth=Depends(require_auth)):
         "iat": int(now.timestamp()),
         "exp": int((now + timedelta(minutes=req.minutes_valid)).timestamp()),
     }
-    token = jwt.encode(payload, SECRET_KEY, algorithm=JWT_ALG)
+    token = _get_jwt().encode(payload, SECRET_KEY, algorithm=JWT_ALG)
     return {"qr_token": token, "session_id": session_id}
 
 # ---------------------- Attendance ----------------------
 class FaceMarkBody(BaseModel):
+    image_base64: str
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+
+class QRMarkRequest(BaseModel):
+    qr_token: str
     lat: Optional[float] = None
     lng: Optional[float] = None
 
 @app.post("/attendance/mark/face")
-async def mark_attendance_face(lat: Optional[float] = Body(None), lng: Optional[float] = Body(None), file: UploadFile = File(...), auth=Depends(require_auth)):
-    # Load user
+async def mark_attendance_face(body: FaceMarkBody, auth=Depends(require_auth)):
     u = db["user"].find_one({"_id": to_object_id(auth["sub"])})
     if not u or not u.get("face_phash"):
         raise HTTPException(status_code=400, detail="No face on file. Upload in profile first")
-    # Compute phash of submitted image
-    data = await file.read()
     try:
+        data = base64.b64decode(body.image_base64.split(",")[-1])
         ph = phash_from_image_bytes(data)
+        import imagehash  # lazy import
+    except HTTPException:
+        raise
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid image")
     stored_ph = u.get("face_phash")
-    # Compare hamming distance
-    dist = imagehash.hex_to_hash(ph) - imagehash.hex_to_hash(stored_ph)
-    inside = check_geofence(lat, lng)
+    try:
+        dist = imagehash.hex_to_hash(ph) - imagehash.hex_to_hash(stored_ph)
+    except Exception:
+        dist = 9999
+    inside = check_geofence(body.lat, body.lng)
     if dist <= 10 and inside:
         att = AttendanceSchema(
             user_id=str(u["_id"]),
             method='face',
-            lat=lat, lng=lng, inside_geofence=True,
+            lat=body.lat, lng=body.lng, inside_geofence=True,
             status='present', reason=None,
             metadata=None,
             created_at=datetime.now(timezone.utc),
@@ -364,7 +430,7 @@ async def mark_attendance_face(lat: Optional[float] = Body(None), lng: Optional[
         att = AttendanceSchema(
             user_id=str(u["_id"]),
             method='face',
-            lat=lat, lng=lng, inside_geofence=inside,
+            lat=body.lat, lng=body.lng, inside_geofence=inside,
             status='rejected', reason=("Face mismatch" if dist > 10 else "Outside geofence"),
             metadata={"distance": dist},
             created_at=datetime.now(timezone.utc),
@@ -372,11 +438,6 @@ async def mark_attendance_face(lat: Optional[float] = Body(None), lng: Optional[
         )
         create_document("attendance", att)
         raise HTTPException(status_code=400, detail="Face mismatch or outside geofence")
-
-class QRMarkRequest(BaseModel):
-    qr_token: str
-    lat: Optional[float] = None
-    lng: Optional[float] = None
 
 @app.post("/attendance/mark/qr")
 def mark_attendance_qr(req: QRMarkRequest, auth=Depends(require_auth)):
@@ -454,17 +515,14 @@ def admin_reports(
 ):
     if auth.get("role") not in ["faculty", "admin"]:
         raise HTTPException(status_code=403, detail="Forbidden")
-    # Build filter by joining attendance with users in-memory for simple stats
     start_dt = datetime.fromisoformat(start) if start else datetime.now(timezone.utc) - timedelta(days=30)
     end_dt = datetime.fromisoformat(end) if end else datetime.now(timezone.utc)
     atts = list(db["attendance"].find({
         "created_at": {"$gte": start_dt, "$lte": end_dt},
         "status": "present"
     }))
-    # Map users
     user_ids = list({a.get("user_id") for a in atts if a.get("user_id")})
     users = {str(u["_id"]): u for u in db["user"].find({"_id": {"$in": [to_object_id(uid) for uid in user_ids]}})}
-    # Filter by department/class_section if provided
     filtered = []
     for a in atts:
         u = users.get(a.get("user_id"))
@@ -475,7 +533,6 @@ def admin_reports(
         if class_section and u.get("class_section") != class_section:
             continue
         filtered.append(a)
-    # Aggregate
     total = len(filtered)
     by_method = {}
     for a in filtered:
