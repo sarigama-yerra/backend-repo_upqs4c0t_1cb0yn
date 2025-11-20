@@ -1,7 +1,26 @@
 import os
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
+import io
+import base64
+from datetime import datetime, timedelta, timezone
+from typing import Optional, List, Literal
 
+from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, Body, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel
+
+from database import db, create_document, get_documents
+from schemas import User as UserSchema, Attendance as AttendanceSchema, Session as SessionSchema
+
+from passlib.context import CryptContext
+import jwt
+from cryptography.fernet import Fernet
+from PIL import Image
+import imagehash
+
+# -----------------------------------------------------------------------------
+# Configuration
+# -----------------------------------------------------------------------------
 app = FastAPI()
 
 app.add_middleware(
@@ -12,60 +31,460 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.get("/")
-def read_root():
-    return {"message": "Hello from FastAPI Backend!"}
+security = HTTPBearer()
 
-@app.get("/api/hello")
-def hello():
-    return {"message": "Hello from the backend API!"}
+SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-key-change")
+JWT_ALG = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24
+
+FACE_ENC_KEY = os.getenv("FACE_ENC_KEY")
+if not FACE_ENC_KEY:
+    # Derive a deterministic Fernet key from SECRET_KEY for demo env
+    derived = base64.urlsafe_b64encode((SECRET_KEY * 2)[:32].encode())
+    FACE_ENC_KEY = derived.decode()
+fernet = Fernet(FACE_ENC_KEY)
+
+# Geofence config
+COLLEGE_LAT = float(os.getenv("COLLEGE_LAT", "12.9716"))
+COLLEGE_LNG = float(os.getenv("COLLEGE_LNG", "77.5946"))
+GEOFENCE_RADIUS_M = float(os.getenv("GEOFENCE_RADIUS_M", "300.0"))
+
+# Password hashing (pure Python, avoids system deps)
+pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
+
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+
+def to_object_id(id_str: str):
+    from bson import ObjectId
+    try:
+        return ObjectId(id_str)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid id")
+
+
+def hash_password(password: str) -> str:
+    return pwd_context.hash(password)
+
+
+def verify_password(password: str, hashed: str) -> bool:
+    try:
+        return pwd_context.verify(password, hashed)
+    except Exception:
+        return False
+
+
+def create_access_token(user_id: str, role: str) -> str:
+    now = datetime.now(timezone.utc)
+    payload = {
+        "sub": user_id,
+        "role": role,
+        "type": "access",
+        "iat": int(now.timestamp()),
+        "exp": int((now + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)).timestamp())
+    }
+    return jwt.encode(payload, SECRET_KEY, algorithm=JWT_ALG)
+
+
+def create_reset_token(user_id: str) -> str:
+    now = datetime.now(timezone.utc)
+    payload = {
+        "sub": user_id,
+        "type": "reset",
+        "iat": int(now.timestamp()),
+        "exp": int((now + timedelta(minutes=30)).timestamp())
+    }
+    return jwt.encode(payload, SECRET_KEY, algorithm=JWT_ALG)
+
+
+def decode_token(token: str) -> dict:
+    try:
+        return jwt.decode(token, SECRET_KEY, algorithms=[JWT_ALG])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+
+def require_auth(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    payload = decode_token(credentials.credentials)
+    if payload.get("type") != "access":
+        raise HTTPException(status_code=401, detail="Invalid token type")
+    return payload
+
+
+def haversine_m(lat1, lon1, lat2, lon2):
+    from math import radians, cos, sin, asin, sqrt
+    R = 6371000.0
+    dlat = radians(lat2 - lat1)
+    dlon = radians(lon2 - lon1)
+    a = sin(dlat/2)**2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon/2)**2
+    c = 2 * asin(sqrt(a))
+    return R * c
+
+
+def check_geofence(lat: Optional[float], lng: Optional[float]) -> bool:
+    if lat is None or lng is None:
+        return False
+    dist = haversine_m(lat, lng, COLLEGE_LAT, COLLEGE_LNG)
+    return dist <= GEOFENCE_RADIUS_M
+
+
+def phash_from_image_bytes(data: bytes) -> str:
+    image = Image.open(io.BytesIO(data)).convert("RGB").resize((256, 256))
+    return str(imagehash.phash(image))
+
+
+def encrypt_bytes(data: bytes) -> bytes:
+    return fernet.encrypt(data)
+
+
+def decrypt_bytes(data: bytes) -> bytes:
+    return fernet.decrypt(data)
+
+
+# -----------------------------------------------------------------------------
+# Models
+# -----------------------------------------------------------------------------
+class RegisterRequest(BaseModel):
+    full_name: str
+    department: str
+    class_section: str
+    username: str
+    password: str
+    student_id: Optional[str] = None
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+class ForgotRequest(BaseModel):
+    username: str
+
+class ResetRequest(BaseModel):
+    token: str
+    new_password: str
+
+class UpdateProfileRequest(BaseModel):
+    full_name: Optional[str] = None
+    department: Optional[str] = None
+    class_section: Optional[str] = None
+    student_id: Optional[str] = None
+
+class Geopoint(BaseModel):
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+
+class QRSessionCreate(BaseModel):
+    department: str
+    class_section: str
+    minutes_valid: int = 10
+
+# -----------------------------------------------------------------------------
+# Core Routes
+# -----------------------------------------------------------------------------
+@app.get("/")
+def root():
+    return {"message": "Attendance Backend Running"}
 
 @app.get("/test")
 def test_database():
-    """Test endpoint to check if database is available and accessible"""
-    response = {
-        "backend": "✅ Running",
-        "database": "❌ Not Available",
-        "database_url": None,
-        "database_name": None,
-        "connection_status": "Not Connected",
+    info = {
+        "backend": "ok",
+        "db": False,
         "collections": []
     }
-    
     try:
-        # Try to import database module
-        from database import db
-        
         if db is not None:
-            response["database"] = "✅ Available"
-            response["database_url"] = "✅ Configured"
-            response["database_name"] = db.name if hasattr(db, 'name') else "✅ Connected"
-            response["connection_status"] = "Connected"
-            
-            # Try to list collections to verify connectivity
-            try:
-                collections = db.list_collection_names()
-                response["collections"] = collections[:10]  # Show first 10 collections
-                response["database"] = "✅ Connected & Working"
-            except Exception as e:
-                response["database"] = f"⚠️  Connected but Error: {str(e)[:50]}"
-        else:
-            response["database"] = "⚠️  Available but not initialized"
-            
-    except ImportError:
-        response["database"] = "❌ Database module not found (run enable-database first)"
+            info["db"] = True
+            info["collections"] = db.list_collection_names()
     except Exception as e:
-        response["database"] = f"❌ Error: {str(e)[:50]}"
-    
-    # Check environment variables
-    import os
-    response["database_url"] = "✅ Set" if os.getenv("DATABASE_URL") else "❌ Not Set"
-    response["database_name"] = "✅ Set" if os.getenv("DATABASE_NAME") else "❌ Not Set"
-    
-    return response
+        info["error"] = str(e)
+    return info
 
+# ---------------------- Auth ----------------------
+@app.post("/auth/register")
+def register(req: RegisterRequest):
+    # Check unique
+    if db["user"].find_one({"username": req.username}):
+        raise HTTPException(status_code=400, detail="Username already exists")
+    user = UserSchema(
+        full_name=req.full_name,
+        department=req.department,
+        class_section=req.class_section,
+        username=req.username,
+        password_hash=hash_password(req.password),
+        student_id=req.student_id,
+        role='student',
+        approved=False,
+        created_at=datetime.now(timezone.utc),
+        updated_at=datetime.now(timezone.utc)
+    )
+    user_id = create_document("user", user)
+    return {"user_id": user_id, "approved": False}
 
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+@app.post("/auth/login")
+def login(req: LoginRequest):
+    u = db["user"].find_one({"username": req.username})
+    if not u:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    if not verify_password(req.password, u.get("password_hash", "")):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    token = create_access_token(str(u["_id"]), u.get("role", "student"))
+    return {"access_token": token, "approved": u.get("approved", False), "role": u.get("role", "student")}
+
+@app.post("/auth/forgot")
+def forgot(req: ForgotRequest):
+    u = db["user"].find_one({"username": req.username})
+    if not u:
+        # Don't reveal existence
+        return {"status": "ok"}
+    reset_token = create_reset_token(str(u["_id"]))
+    # In real app, email/SMS the token; here we return
+    return {"reset_token": reset_token}
+
+@app.post("/auth/reset")
+def reset(req: ResetRequest):
+    payload = decode_token(req.token)
+    if payload.get("type") != "reset":
+        raise HTTPException(status_code=400, detail="Invalid reset token")
+    user_id = payload.get("sub")
+    db["user"].update_one({"_id": to_object_id(user_id)}, {"$set": {"password_hash": hash_password(req.new_password), "updated_at": datetime.now(timezone.utc)}})
+    return {"status": "password-updated"}
+
+# ---------------------- Profile ----------------------
+@app.get("/me")
+def get_me(auth=Depends(require_auth)):
+    u = db["user"].find_one({"_id": to_object_id(auth["sub"])}, {"password_hash": 0, "face_encrypted": 0})
+    if not u:
+        raise HTTPException(status_code=404, detail="User not found")
+    u["_id"] = str(u["_id"])
+    return u
+
+@app.put("/me")
+def update_me(req: UpdateProfileRequest, auth=Depends(require_auth)):
+    updates = {k: v for k, v in req.model_dump().items() if v is not None}
+    if updates:
+        updates["updated_at"] = datetime.now(timezone.utc)
+        db["user"].update_one({"_id": to_object_id(auth["sub"])}, {"$set": updates})
+    return {"status": "updated"}
+
+@app.post("/me/photo")
+async def upload_face(file: UploadFile = File(...), auth=Depends(require_auth)):
+    data = await file.read()
+    try:
+        ph = phash_from_image_bytes(data)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid image")
+    enc = encrypt_bytes(data)
+    db["user"].update_one(
+        {"_id": to_object_id(auth["sub"])},
+        {"$set": {"face_encrypted": enc, "face_phash": ph, "updated_at": datetime.now(timezone.utc)}}
+    )
+    return {"status": "face-updated"}
+
+# ---------------------- QR Tools ----------------------
+@app.post("/qr/self")
+def generate_self_qr(geo: Geopoint = Body(None), auth=Depends(require_auth)):
+    now = datetime.now(timezone.utc)
+    payload = {
+        "sub": auth["sub"],
+        "type": "qr_self",
+        "iat": int(now.timestamp()),
+        "exp": int((now + timedelta(minutes=5)).timestamp()),
+    }
+    if geo and geo.lat and geo.lng:
+        payload["lat"] = geo.lat
+        payload["lng"] = geo.lng
+    token = jwt.encode(payload, SECRET_KEY, algorithm=JWT_ALG)
+    return {"qr_token": token}
+
+@app.post("/qr/session")
+def generate_session_qr(req: QRSessionCreate, auth=Depends(require_auth)):
+    if auth.get("role") not in ["faculty", "admin"]:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    now = datetime.now(timezone.utc)
+    token_id = base64.urlsafe_b64encode(os.urandom(16)).decode().rstrip("=")
+    session = SessionSchema(
+        creator_id=auth["sub"],
+        department=req.department,
+        class_section=req.class_section,
+        expires_at=now + timedelta(minutes=req.minutes_valid),
+        token_id=token_id,
+        active=True,
+        created_at=now,
+        updated_at=now,
+    )
+    session_id = create_document("session", session)
+    payload = {
+        "type": "qr_session",
+        "sid": session_id,
+        "tid": token_id,
+        "iat": int(now.timestamp()),
+        "exp": int((now + timedelta(minutes=req.minutes_valid)).timestamp()),
+    }
+    token = jwt.encode(payload, SECRET_KEY, algorithm=JWT_ALG)
+    return {"qr_token": token, "session_id": session_id}
+
+# ---------------------- Attendance ----------------------
+class FaceMarkBody(BaseModel):
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+
+@app.post("/attendance/mark/face")
+async def mark_attendance_face(lat: Optional[float] = Body(None), lng: Optional[float] = Body(None), file: UploadFile = File(...), auth=Depends(require_auth)):
+    # Load user
+    u = db["user"].find_one({"_id": to_object_id(auth["sub"])})
+    if not u or not u.get("face_phash"):
+        raise HTTPException(status_code=400, detail="No face on file. Upload in profile first")
+    # Compute phash of submitted image
+    data = await file.read()
+    try:
+        ph = phash_from_image_bytes(data)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid image")
+    stored_ph = u.get("face_phash")
+    # Compare hamming distance
+    dist = imagehash.hex_to_hash(ph) - imagehash.hex_to_hash(stored_ph)
+    inside = check_geofence(lat, lng)
+    if dist <= 10 and inside:
+        att = AttendanceSchema(
+            user_id=str(u["_id"]),
+            method='face',
+            lat=lat, lng=lng, inside_geofence=True,
+            status='present', reason=None,
+            metadata=None,
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc)
+        )
+        att_id = create_document("attendance", att)
+        return {"status": "marked", "attendance_id": att_id, "method": "face"}
+    else:
+        att = AttendanceSchema(
+            user_id=str(u["_id"]),
+            method='face',
+            lat=lat, lng=lng, inside_geofence=inside,
+            status='rejected', reason=("Face mismatch" if dist > 10 else "Outside geofence"),
+            metadata={"distance": dist},
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc)
+        )
+        create_document("attendance", att)
+        raise HTTPException(status_code=400, detail="Face mismatch or outside geofence")
+
+class QRMarkRequest(BaseModel):
+    qr_token: str
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+
+@app.post("/attendance/mark/qr")
+def mark_attendance_qr(req: QRMarkRequest, auth=Depends(require_auth)):
+    payload = decode_token(req.qr_token)
+    t = payload.get("type")
+    inside = check_geofence(req.lat, req.lng)
+    if not inside:
+        att = AttendanceSchema(
+            user_id=auth["sub"], method='qr_self' if t=='qr_self' else 'qr_session',
+            lat=req.lat, lng=req.lng, inside_geofence=False, status='rejected',
+            reason='Outside geofence', metadata={"token": t},
+            created_at=datetime.now(timezone.utc), updated_at=datetime.now(timezone.utc)
+        )
+        create_document("attendance", att)
+        raise HTTPException(status_code=400, detail="Outside geofence")
+
+    if t == 'qr_self':
+        if payload.get("sub") != auth["sub"]:
+            raise HTTPException(status_code=400, detail="QR does not belong to this user")
+        att = AttendanceSchema(
+            user_id=auth["sub"], method='qr_self', lat=req.lat, lng=req.lng, inside_geofence=True,
+            status='present', reason=None, metadata=None,
+            created_at=datetime.now(timezone.utc), updated_at=datetime.now(timezone.utc)
+        )
+        att_id = create_document("attendance", att)
+        return {"status": "marked", "attendance_id": att_id, "method": "qr_self"}
+    elif t == 'qr_session':
+        sid = payload.get("sid")
+        tid = payload.get("tid")
+        s = db["session"].find_one({"_id": to_object_id(sid), "token_id": tid, "active": True})
+        if not s:
+            raise HTTPException(status_code=400, detail="Invalid session")
+        att = AttendanceSchema(
+            user_id=auth["sub"], method='qr_session', lat=req.lat, lng=req.lng, inside_geofence=True,
+            status='present', reason=None, metadata={"session_id": sid},
+            created_at=datetime.now(timezone.utc), updated_at=datetime.now(timezone.utc)
+        )
+        att_id = create_document("attendance", att)
+        return {"status": "marked", "attendance_id": att_id, "method": "qr_session"}
+    else:
+        raise HTTPException(status_code=400, detail="Unsupported QR token")
+
+# ---------------------- History & Reports ----------------------
+@app.get("/attendance/history")
+def history(auth=Depends(require_auth)):
+    docs = get_documents("attendance", {"user_id": auth["sub"]}, limit=None)
+    for d in docs:
+        d["_id"] = str(d["_id"]) if d.get("_id") else None
+    docs.sort(key=lambda x: x.get("created_at", datetime.min), reverse=True)
+    return {"items": docs}
+
+@app.get("/admin/registrations")
+def pending_registrations(auth=Depends(require_auth)):
+    if auth.get("role") not in ["faculty", "admin"]:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    users = list(db["user"].find({"approved": False}, {"password_hash": 0, "face_encrypted": 0}))
+    for u in users:
+        u["_id"] = str(u["_id"]) if u.get("_id") else None
+    return {"items": users}
+
+@app.patch("/admin/users/{user_id}/approve")
+def approve_user(user_id: str, approve: bool = Query(True), auth=Depends(require_auth)):
+    if auth.get("role") not in ["faculty", "admin"]:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    res = db["user"].update_one({"_id": to_object_id(user_id)}, {"$set": {"approved": approve, "updated_at": datetime.now(timezone.utc)}})
+    return {"matched": res.matched_count, "modified": res.modified_count}
+
+@app.get("/admin/reports")
+def admin_reports(
+    department: Optional[str] = None,
+    class_section: Optional[str] = None,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    auth=Depends(require_auth)
+):
+    if auth.get("role") not in ["faculty", "admin"]:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    # Build filter by joining attendance with users in-memory for simple stats
+    start_dt = datetime.fromisoformat(start) if start else datetime.now(timezone.utc) - timedelta(days=30)
+    end_dt = datetime.fromisoformat(end) if end else datetime.now(timezone.utc)
+    atts = list(db["attendance"].find({
+        "created_at": {"$gte": start_dt, "$lte": end_dt},
+        "status": "present"
+    }))
+    # Map users
+    user_ids = list({a.get("user_id") for a in atts if a.get("user_id")})
+    users = {str(u["_id"]): u for u in db["user"].find({"_id": {"$in": [to_object_id(uid) for uid in user_ids]}})}
+    # Filter by department/class_section if provided
+    filtered = []
+    for a in atts:
+        u = users.get(a.get("user_id"))
+        if not u:
+            continue
+        if department and u.get("department") != department:
+            continue
+        if class_section and u.get("class_section") != class_section:
+            continue
+        filtered.append(a)
+    # Aggregate
+    total = len(filtered)
+    by_method = {}
+    for a in filtered:
+        m = a.get("method", "unknown")
+        by_method[m] = by_method.get(m, 0) + 1
+    return {"total": total, "by_method": by_method}
+
+# ---------------------- Privacy ----------------------
+@app.delete("/me/face")
+def delete_face(auth=Depends(require_auth)):
+    db["user"].update_one({"_id": to_object_id(auth["sub"])}, {"$unset": {"face_encrypted": "", "face_phash": ""}, "$set": {"updated_at": datetime.now(timezone.utc)}})
+    return {"status": "face-data-deleted"}
